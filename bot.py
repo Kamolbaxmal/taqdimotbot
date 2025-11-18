@@ -1,115 +1,158 @@
 import os
-import io
 import logging
-from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+import io
 from dotenv import load_dotenv
-from fpdf import FPDF
+from PIL import Image
+from telegram import InputFile, Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-# ========== ENV ==========
+# ===== Load env =====
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)  # admin chat_id
 
+# ===== Logging =====
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Foydalanuvchi rasm va state saqlash
-user_data = {}
-ASK_NAME = 1
+if not BOT_TOKEN or not ADMIN_ID:
+    raise SystemExit("BOT_TOKEN yoki ADMIN_ID .env da yo'q")
 
-# ========== BOT HANDLERLARI ==========
-def get_keyboard():
-    keyboard = [
-        [KeyboardButton("📷 Rasm yuborish"), KeyboardButton("✅ Tayyorla")],
-        [KeyboardButton("ℹ️ Info"), KeyboardButton("❌ Bekor qilish")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+# ===== User temporary storage =====
+USER_PHOTOS = {}
 
+# ===== Keyboard buttons =====
+keyboard = ReplyKeyboardMarkup(
+    [["Start", "Finish"]],
+    resize_keyboard=True
+)
+
+# ===== Commands =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.effective_user.id] = {"photos": []}
     await update.message.reply_text(
-        "🎉 Salom! Bot ishlayapti!\nRasmlarni yuboring va tugmalardan foydalaning.",
-        reply_markup=get_keyboard()
+        "Tayyor turibman 😊\nRasmlarni yig‘ish uchun Start bosing.",
+        reply_markup=keyboard
     )
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_data:
-        user_data[user_id] = {"photos": []}
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    text = update.message.text.lower()
 
-    if not update.message.photo:
-        await update.message.reply_text("❗️ Iltimos, faqat rasm yuboring.")
+    if text == "start":
+        USER_PHOTOS[user_id] = []
+        await update.message.reply_text("Start bosildi. Rasmlarni yuboring 📸")
         return
 
-    photo = update.message.photo[-1]
-    file_obj = await photo.get_file()
-    bio = io.BytesIO()
-    await file_obj.download(out=bio)
-    bio.seek(0)
+    if text == "finish":
+        if user_id not in USER_PHOTOS or len(USER_PHOTOS[user_id]) == 0:
+            await update.message.reply_text("Rasm yo‘qku 😅 Avval rasm yuboring.")
+            return
 
-    user_data[user_id]["photos"].append(bio)
-    await update.message.reply_text(f"✅ Rasm qabul qilindi. Siz hozir {len(user_data[user_id]['photos'])} rasm yubordingiz.")
+        await update.message.reply_text("PDF uchun nom kiriting:")
+        context.user_data["waiting_for_name"] = True
+        return
 
-async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    photos = user_data.get(user_id, {}).get("photos", [])
-    if not photos:
-        await update.message.reply_text("❗️ Siz hali hech qanday rasm yubormagansiz.")
-        return ConversationHandler.END
+# ===== Handle text (PDF name) =====
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.message.from_user.id
+        text = update.message.text
 
-    await update.message.reply_text("📛 PDF faylga qanday ism qo‘yaylik?")
-    return ASK_NAME
+        if not context.user_data.get("waiting_for_name"):
+            # Oddiy matn — e'lon qilmoqchi bo'lsangiz boshqa ishlov bering
+            return
 
-async def name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    photos = user_data.get(user_id, {}).get("photos", [])
-    file_name = update.message.text.strip()
-    if not file_name:
-        file_name = "output"
+        pdf_name = text.strip() + ".pdf"
+        photos = USER_PHOTOS.get(user_id, [])
 
-    pdf = FPDF()
-    for bio in photos:
-        pdf.add_page()
-        pdf.image(bio, x=10, y=10, w=180)
+        img_list = []
+        for b in photos:
+            b.seek(0)  # <--- MUHIM: har safar boshidan o'qish
+            img = Image.open(b).convert("RGB")
+            img_list.append(img)
 
-    pdf_bytes = io.BytesIO()
-    pdf.output(pdf_bytes)
-    pdf_bytes.seek(0)
+        pdf_bytes = io.BytesIO()
+        if len(img_list) == 1:
+            img_list[0].save(pdf_bytes, format="PDF")
+        else:
+            img_list[0].save(pdf_bytes, format="PDF", save_all=True, append_images=img_list[1:])
 
-    file = InputFile(pdf_bytes, filename=f"{file_name}.pdf")
-    await update.message.reply_document(file)
-    await update.message.reply_text(f"✅ Tayyor! PDF fayl nomi: {file_name}.pdf")
+        pdf_bytes.seek(0)
 
-    user_data[user_id]["photos"] = []
-    return ConversationHandler.END
+        # Foydalanuvchiga yuborish
+        await update.message.reply_document(
+            document=InputFile(pdf_bytes, filename=pdf_name)
+        )
 
-async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Bot ishlayapti!\n"
-        "📍 Render hosting\n✅ Python 3\n🎯 Telegram Bot API"
-    )
+        # Adminga yuborish uchun pointerni boshiga qaytaramiz
+        pdf_bytes.seek(0)
+        await context.bot.send_document(
+            chat_id=ADMIN_ID,
+            document=InputFile(pdf_bytes, filename=f"{update.message.from_user.full_name}_{pdf_name}")
+        )
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Jarayon bekor qilindi.")
-    user_data[update.effective_user.id] = {"photos": []}
-    return ConversationHandler.END
+        # Tozalash
+        USER_PHOTOS[user_id] = []
+        context.user_data["waiting_for_name"] = False
 
-# ========== MAIN ==========
+        # PIL obyektlarini yopish (garov)
+        for im in img_list:
+            im.close()
+
+    except Exception as e:
+        logger.exception("text_handler da xato:")
+        await update.message.reply_text("PDF yaratishda xatolik yuz berdi. Iltimos qayta urinib ko'ring.")
+
+# ===== Handle photos =====
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.message.from_user.id
+
+        if user_id not in USER_PHOTOS:
+            await update.message.reply_text("Avval Start bosing 😄")
+            return
+
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+
+        bio = io.BytesIO()
+        await file.download_to_memory(out=bio)
+        bio.seek(0)
+
+        # Har bir foydalanuvchi uchun BytesIO ni saqlaymiz
+        USER_PHOTOS[user_id].append(bio)
+
+        # Foydalanuvchiga qabul qilindi
+        await update.message.reply_text("Rasm qabul qilindi 📥")
+
+        # Adminga ulashish uchun nusxasini yuboramiz (yoki bio.seek(0) qilamiz)
+        # Ehtiyot: yuborganidan keyin pointer oxirga suriladi, shuning uchun yuborishdan oldin seek(0)
+        send_bio = io.BytesIO(bio.getvalue())  # nusxa yaratish, originalga ta'sir qilmaydi
+        send_bio.seek(0)
+        await context.bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=send_bio,
+            caption=f"Rasm {update.message.from_user.full_name} dan olindi"
+        )
+
+    except Exception as e:
+        logger.exception("photo_handler da xato:")
+        await update.message.reply_text("Rasmni qabul qilishda xatolik yuz berdi. Iltimos qayta yuboring.")
+
+# ===== Main =====
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("✅ Tayyorla"), finish_handler)],
-        states={ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_handler)]},
-        fallbacks=[MessageHandler(filters.Regex("❌ Bekor qilish"), cancel)]
-    )
-
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex("^(Start|Finish)$"), handle_buttons))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    app.add_handler(MessageHandler(filters.Regex("ℹ️ Info"), info))
-    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    print("🤖 Bot ishga tushdi...")
+    logger.info("Bot ishga tushdi...")
     app.run_polling()
 
-if name == "main":
+if __name__ == "__main__":
     main()
