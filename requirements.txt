@@ -1,3 +1,6 @@
-python-telegram-bot
+python-telegram-bot==20.0
 python-dotenv
+Pillow
 fpdf
+reportlab
+python-pptx
